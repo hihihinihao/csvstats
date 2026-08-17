@@ -1,0 +1,16 @@
+# Go 编译产物
+csvstats
+csvstats.exe
+*.exe
+*.test
+*.out
+
+# Node（tools 脚本临时依赖）
+node_modules/
+
+# 本地数据 / 日志
+*.log
+
+# IDE
+.idea/
+.vscode/

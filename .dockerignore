@@ -1,0 +1,6 @@
+.git
+*.jsonl
+testdata
+node_modules
+tools
+*.log
