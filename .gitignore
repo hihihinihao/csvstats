@@ -11,6 +11,9 @@ node_modules/
 # 本地数据 / 日志
 *.log
 
+# JSONL 过程记录（考核走邮箱提交，不入 git 以免污染每轮 diff）
+AI开发考核_*.jsonl
+
 # IDE
 .idea/
 .vscode/
