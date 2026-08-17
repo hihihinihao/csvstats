@@ -3,6 +3,7 @@
 // 参考开源项目 github.com/adamdecaf/csvq 重构 + 扩展（Apache-2.0）。
 // R1：核心变换（多文件输入、-keep 选列、-d 分隔符、输入健壮性）。
 // R2：数值感知多列排序（-sort.asc / -sort.dsc）。
+// R3：集中式输出层（-format csv/table/tabs/markdown/json，独立 internal/report 包）。
 // 约束：纯标准库。
 package main
 
@@ -18,6 +19,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/hihihinihao/csvstats/internal/report"
 )
 
 // SortKey 表示一个排序列及方向（按命令行出现顺序）。
@@ -34,6 +37,7 @@ func main() {
 	fs := flag.NewFlagSet("csvstats", flag.ExitOnError)
 	keep := fs.String("keep", "", "逗号分隔的列名列表，输出顺序按此指定")
 	delimFlag := fs.String("d", ",", "字段分隔符（必须是恰好一个字符，支持多字节 UTF-8）")
+	formatFlag := fs.String("format", "", "输出格式: csv/table/tabs/markdown/json（默认 csv）")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "用法: csvstats [选项] 文件1 [文件2 ...]\n")
 		fmt.Fprintf(os.Stderr, "选项:\n")
@@ -41,10 +45,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  -d 分隔符          字段分隔符（默认逗号，支持多字节 UTF-8）\n")
 		fmt.Fprintf(os.Stderr, "  -sort.asc 列[,列]  按列升序排序（可多个，按出现顺序；支持 = 写法）\n")
 		fmt.Fprintf(os.Stderr, "  -sort.dsc 列[,列]  按列降序排序（同上）\n")
+		fmt.Fprintf(os.Stderr, "  -format 格式       输出格式: csv/table/tabs/markdown/json（默认 csv）\n")
 	}
 	fs.Parse(cleanArgs)
 
 	delim, err := parseDelimiter(*delimFlag)
+	if err != nil {
+		fatalf("%v", err)
+	}
+
+	format, err := report.ParseFormat(*formatFlag)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -57,7 +67,7 @@ func main() {
 
 	exitCode := 0
 	for _, path := range files {
-		if err := processFile(path, *keep, delim, sortKeys); err != nil {
+		if err := processFile(path, *keep, delim, sortKeys, format); err != nil {
 			fmt.Fprintf(os.Stderr, "csvstats: %v\n", err)
 			exitCode = 1
 		}
@@ -116,7 +126,7 @@ func parseDelimiter(s string) (rune, error) {
 	return runes[0], nil
 }
 
-func processFile(path, keep string, delim rune, sortKeys []SortKey) error {
+func processFile(path, keep string, delim rune, sortKeys []SortKey, format report.Format) error {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -149,53 +159,15 @@ func processFile(path, keep string, delim rune, sortKeys []SortKey) error {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 
+	// 排序在 -keep 之后的列空间上进行：索引指向输出行的位置。
+	var resolved []resolvedSortKey
 	if len(sortKeys) > 0 {
-		// 排序在 -keep 之后的列空间上进行：索引指向输出行的位置。
-		resolved, err := resolveSortKeys(sortKeys, outHeaders)
+		resolved, err = resolveSortKeys(sortKeys, outHeaders)
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
-		return emitSorted(path, rdr, outHeaders, outIdx, delim, resolved)
 	}
-	return emitStream(path, rdr, outHeaders, outIdx, delim)
-}
-
-// emitStream 无排序时逐行流式输出（R1 行为）。
-func emitStream(path string, rdr *csv.Reader, outHeaders []string, outIdx []int, delim rune) error {
-	rec, err := rdr.Read()
-	if err == io.EOF {
-		fmt.Fprintf(os.Stderr, "csvstats: %s 只有表头，无数据行\n", path)
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("%s: %w", path, wrapParseError(err))
-	}
-
-	w := csv.NewWriter(os.Stdout)
-	w.Comma = delim
-	if err := w.Write(outHeaders); err != nil {
-		return fmt.Errorf("%s: 写出表头失败: %w", path, err)
-	}
-	if err := w.Write(mapRow(rec, outIdx)); err != nil {
-		return fmt.Errorf("%s: 写出行失败: %w", path, err)
-	}
-	for {
-		rec, err := rdr.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("%s: %w", path, wrapParseError(err))
-		}
-		if err := w.Write(mapRow(rec, outIdx)); err != nil {
-			return fmt.Errorf("%s: 写出行失败: %w", path, err)
-		}
-	}
-	w.Flush()
-	if err := w.Error(); err != nil {
-		return fmt.Errorf("%s: 写出结果失败: %w", path, err)
-	}
-	return nil
+	return emit(path, rdr, outHeaders, outIdx, resolved, format)
 }
 
 // resolvedSortKey 排序时输出行内的列位置。
@@ -204,8 +176,9 @@ type resolvedSortKey struct {
 	desc bool
 }
 
-// emitSorted 有排序时：读入全部行、按 keep 空间映射、稳定排序后输出。
-func emitSorted(path string, rdr *csv.Reader, outHeaders []string, outIdx []int, delim rune, sortKeys []resolvedSortKey) error {
+// emit 读入全部行、映射到 -keep 列空间、（可选）稳定排序，再交给 report 包按格式输出。
+// 注：R3 起统一为内存结果模型以支撑多格式报表；大文件流式处理留待后续轮次优化。
+func emit(path string, rdr *csv.Reader, outHeaders []string, outIdx []int, sortKeys []resolvedSortKey, format report.Format) error {
 	var rows [][]string
 	for {
 		rec, err := rdr.Read()
@@ -222,30 +195,18 @@ func emitSorted(path string, rdr *csv.Reader, outHeaders []string, outIdx []int,
 		return nil
 	}
 
-	sort.SliceStable(rows, func(i, j int) bool {
-		for _, k := range sortKeys {
-			if cmp := compareCells(rows[i][k.idx], rows[j][k.idx], k.desc); cmp != 0 {
-				return cmp < 0
+	if len(sortKeys) > 0 {
+		sort.SliceStable(rows, func(i, j int) bool {
+			for _, k := range sortKeys {
+				if cmp := compareCells(rows[i][k.idx], rows[j][k.idx], k.desc); cmp != 0 {
+					return cmp < 0
+				}
 			}
-		}
-		return false
-	})
+			return false
+		})
+	}
 
-	w := csv.NewWriter(os.Stdout)
-	w.Comma = delim
-	if err := w.Write(outHeaders); err != nil {
-		return fmt.Errorf("%s: 写出表头失败: %w", path, err)
-	}
-	for _, row := range rows {
-		if err := w.Write(row); err != nil {
-			return fmt.Errorf("%s: 写出行失败: %w", path, err)
-		}
-	}
-	w.Flush()
-	if err := w.Error(); err != nil {
-		return fmt.Errorf("%s: 写出结果失败: %w", path, err)
-	}
-	return nil
+	return report.Write(os.Stdout, format, outHeaders, rows)
 }
 
 // resolveSortKeys 把排序列名解析为输出行内的位置（-keep 之后的空间）。
