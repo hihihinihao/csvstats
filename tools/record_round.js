@@ -13,9 +13,9 @@ if (!prompt) {
 }
 
 // ★ 按实际情况修改
-const AGENT_TYPE = 'Kilo Code';  // Kilo Code / PI / Cine，填你实际用的
+const AGENT_TYPE = 'Claude Code';  // 实际使用的编程智能体
 const DEV_LANG = 'Go';
-const NAME = '姓名';             // 改成你的名字
+const NAME = 'suhaizhou';          // 你的名字
 const JSONL_FILE = path.join(__dirname, '..', `AI开发考核_${NAME}_csvstats.jsonl`);
 
 const pad = (n) => String(n).padStart(2, '0');
