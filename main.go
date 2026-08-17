@@ -1,8 +1,9 @@
 // csvstats — CSV 数据分析命令行工具
 //
 // 参考开源项目 github.com/adamdecaf/csvq 重构 + 扩展（Apache-2.0）。
-// R1：核心变换 —— 多文件输入、-keep 选列、-d 分隔符、输入健壮性。
-// 约束：纯标准库，仅使用 encoding/csv。
+// R1：核心变换（多文件输入、-keep 选列、-d 分隔符、输入健壮性）。
+// R2：数值感知多列排序（-sort.asc / -sort.dsc）。
+// 约束：纯标准库。
 package main
 
 import (
@@ -12,37 +13,96 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 )
 
-// main 解析参数并逐个处理输入文件。
-// 多文件语义：逐文件处理、按命令行顺序依次输出，每个文件各自打印一次表头（与 csvq 一致）。
-// 任一文件出错：错误输出到 stderr，最终以非 0 退出码结束。
+// SortKey 表示一个排序列及方向（按命令行出现顺序）。
+type SortKey struct {
+	Name string
+	Desc bool
+}
+
 func main() {
-	keep := flag.String("keep", "", "逗号分隔的列名列表，输出顺序按此指定")
-	delimFlag := flag.String("d", ",", "字段分隔符（必须是恰好一个字符，支持多字节 UTF-8）")
-	flag.Parse()
+	// Go 标准 flag 包不保留 -sort.asc / -sort.dsc 的相对顺序，且空值参数需要忽略，
+	// 因此先从 os.Args 中剥离排序参数（保序、忽略空值），剩余参数再交给 flag 解析。
+	sortKeys, cleanArgs := extractSortArgs(os.Args[1:])
+
+	fs := flag.NewFlagSet("csvstats", flag.ExitOnError)
+	keep := fs.String("keep", "", "逗号分隔的列名列表，输出顺序按此指定")
+	delimFlag := fs.String("d", ",", "字段分隔符（必须是恰好一个字符，支持多字节 UTF-8）")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "用法: csvstats [选项] 文件1 [文件2 ...]\n")
+		fmt.Fprintf(os.Stderr, "选项:\n")
+		fmt.Fprintf(os.Stderr, "  -keep 列1,列2      选列，输出顺序按此指定\n")
+		fmt.Fprintf(os.Stderr, "  -d 分隔符          字段分隔符（默认逗号，支持多字节 UTF-8）\n")
+		fmt.Fprintf(os.Stderr, "  -sort.asc 列[,列]  按列升序排序（可多个，按出现顺序；支持 = 写法）\n")
+		fmt.Fprintf(os.Stderr, "  -sort.dsc 列[,列]  按列降序排序（同上）\n")
+	}
+	fs.Parse(cleanArgs)
 
 	delim, err := parseDelimiter(*delimFlag)
 	if err != nil {
 		fatalf("%v", err)
 	}
 
-	files := flag.Args()
+	files := fs.Args()
 	if len(files) == 0 {
-		flag.Usage()
+		fs.Usage()
 		fatalf("至少需要指定一个 CSV 文件")
 	}
 
 	exitCode := 0
 	for _, path := range files {
-		if err := processFile(path, *keep, delim); err != nil {
+		if err := processFile(path, *keep, delim, sortKeys); err != nil {
 			fmt.Fprintf(os.Stderr, "csvstats: %v\n", err)
 			exitCode = 1
 		}
 	}
 	os.Exit(exitCode)
+}
+
+// extractSortArgs 遍历 os.Args，剥离排序参数并保持出现顺序；空值参数直接忽略。
+// 返回 (保序的排序列, 供 flag 解析的其余参数)。
+func extractSortArgs(args []string) ([]SortKey, []string) {
+	var keys []SortKey
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, val, hasInline := splitSortArg(arg)
+		if name == "" {
+			rest = append(rest, arg)
+			continue
+		}
+		desc := name == "sort.dsc"
+		if !hasInline {
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				val = args[i+1]
+				i++ // 消费值参数
+			} else {
+				continue // 空值参数：忽略
+			}
+		}
+		for _, n := range splitKeep(val) {
+			if n != "" {
+				keys = append(keys, SortKey{Name: n, Desc: desc})
+			}
+		}
+	}
+	return keys, rest
+}
+
+// splitSortArg 解析单个参数是否为排序 flag，返回 (flag名, 内联值, 是否有内联值)。
+func splitSortArg(arg string) (name, val string, hasInline bool) {
+	n, v, has := strings.Cut(arg, "=")
+	n = strings.TrimLeft(n, "-")
+	if n != "sort.asc" && n != "sort.dsc" {
+		return "", "", false
+	}
+	return n, v, has
 }
 
 // parseDelimiter 校验分隔符必须是恰好一个字符。
@@ -56,7 +116,7 @@ func parseDelimiter(s string) (rune, error) {
 	return runes[0], nil
 }
 
-func processFile(path, keep string, delim rune) error {
+func processFile(path, keep string, delim rune, sortKeys []SortKey) error {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -89,7 +149,19 @@ func processFile(path, keep string, delim rune) error {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 
-	// 先读一行，用于检测"只有表头、无数据行"的情形（此时不输出空表头）。
+	if len(sortKeys) > 0 {
+		// 排序在 -keep 之后的列空间上进行：索引指向输出行的位置。
+		resolved, err := resolveSortKeys(sortKeys, outHeaders)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		return emitSorted(path, rdr, outHeaders, outIdx, delim, resolved)
+	}
+	return emitStream(path, rdr, outHeaders, outIdx, delim)
+}
+
+// emitStream 无排序时逐行流式输出（R1 行为）。
+func emitStream(path string, rdr *csv.Reader, outHeaders []string, outIdx []int, delim rune) error {
 	rec, err := rdr.Read()
 	if err == io.EOF {
 		fmt.Fprintf(os.Stderr, "csvstats: %s 只有表头，无数据行\n", path)
@@ -100,14 +172,13 @@ func processFile(path, keep string, delim rune) error {
 	}
 
 	w := csv.NewWriter(os.Stdout)
-	w.Comma = delim // 输出沿用输入分隔符，保证可往返
+	w.Comma = delim
 	if err := w.Write(outHeaders); err != nil {
 		return fmt.Errorf("%s: 写出表头失败: %w", path, err)
 	}
-	if err := writeRow(w, rec, outIdx); err != nil {
+	if err := w.Write(mapRow(rec, outIdx)); err != nil {
 		return fmt.Errorf("%s: 写出行失败: %w", path, err)
 	}
-
 	for {
 		rec, err := rdr.Read()
 		if err == io.EOF {
@@ -116,11 +187,10 @@ func processFile(path, keep string, delim rune) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, wrapParseError(err))
 		}
-		if err := writeRow(w, rec, outIdx); err != nil {
+		if err := w.Write(mapRow(rec, outIdx)); err != nil {
 			return fmt.Errorf("%s: 写出行失败: %w", path, err)
 		}
 	}
-
 	w.Flush()
 	if err := w.Error(); err != nil {
 		return fmt.Errorf("%s: 写出结果失败: %w", path, err)
@@ -128,7 +198,124 @@ func processFile(path, keep string, delim rune) error {
 	return nil
 }
 
-// splitKeep 把 -keep 参数按逗号拆分成列名，忽略分隔出的空白片段。
+// resolvedSortKey 排序时输出行内的列位置。
+type resolvedSortKey struct {
+	idx  int
+	desc bool
+}
+
+// emitSorted 有排序时：读入全部行、按 keep 空间映射、稳定排序后输出。
+func emitSorted(path string, rdr *csv.Reader, outHeaders []string, outIdx []int, delim rune, sortKeys []resolvedSortKey) error {
+	var rows [][]string
+	for {
+		rec, err := rdr.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, wrapParseError(err))
+		}
+		rows = append(rows, mapRow(rec, outIdx))
+	}
+	if len(rows) == 0 {
+		fmt.Fprintf(os.Stderr, "csvstats: %s 只有表头，无数据行\n", path)
+		return nil
+	}
+
+	sort.SliceStable(rows, func(i, j int) bool {
+		for _, k := range sortKeys {
+			if cmp := compareCells(rows[i][k.idx], rows[j][k.idx], k.desc); cmp != 0 {
+				return cmp < 0
+			}
+		}
+		return false
+	})
+
+	w := csv.NewWriter(os.Stdout)
+	w.Comma = delim
+	if err := w.Write(outHeaders); err != nil {
+		return fmt.Errorf("%s: 写出表头失败: %w", path, err)
+	}
+	for _, row := range rows {
+		if err := w.Write(row); err != nil {
+			return fmt.Errorf("%s: 写出行失败: %w", path, err)
+		}
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		return fmt.Errorf("%s: 写出结果失败: %w", path, err)
+	}
+	return nil
+}
+
+// resolveSortKeys 把排序列名解析为输出行内的位置（-keep 之后的空间）。
+// 引用不在输出中的列（含未知列）时，报错并列出该列名。
+func resolveSortKeys(keys []SortKey, outHeaders []string) ([]resolvedSortKey, error) {
+	out := make([]resolvedSortKey, 0, len(keys))
+	for _, k := range keys {
+		idx := -1
+		for i, h := range outHeaders {
+			if normHeader(h) == normHeader(k.Name) {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("排序引用的列不在输出中（或未包含在 -keep 中）: %s", k.Name)
+		}
+		out = append(out, resolvedSortKey{idx: idx, desc: k.Desc})
+	}
+	return out, nil
+}
+
+// compareCells 比较两个格值。空值（TrimSpace 后为空）在任何方向上都排最后，
+// 因此空值的判定不参与 desc 翻转——否则降序时空值会被排到最前。
+func compareCells(a, b string, desc bool) int {
+	as, bs := strings.TrimSpace(a), strings.TrimSpace(b)
+	ae, be := as == "", bs == ""
+	if ae || be {
+		switch {
+		case ae && be:
+			return 0
+		case ae:
+			return 1 // a 空 → a 始终排后
+		default:
+			return -1
+		}
+	}
+
+	cmp := compareNonEmpty(as, bs)
+	if desc {
+		return -cmp
+	}
+	return cmp
+}
+
+// compareNonEmpty 比较两个非空值：都解析为数字时按数值比较；
+// 数值相等（含大整数超出 float64 精度、或 "1"/"01"/"1.0" 之类）回落字符串比较保证确定性。
+// NaN/±Inf 这类 ParseFloat 能接受但不能正常比较的特殊值，识别后一律按字符串处理。
+func compareNonEmpty(a, b string) int {
+	an, aErr := strconv.ParseFloat(a, 64)
+	bn, bErr := strconv.ParseFloat(b, 64)
+	aNum := aErr == nil && !specialFloat(an)
+	bNum := bErr == nil && !specialFloat(bn)
+	if aNum && bNum {
+		switch {
+		case an < bn:
+			return -1
+		case an > bn:
+			return 1
+		}
+	}
+	return strings.Compare(a, b)
+}
+
+// specialFloat 判断是否为 NaN / ±Inf —— 它们与任何数值比较都会破坏排序，应按字符串处理。
+func specialFloat(f float64) bool {
+	return math.IsNaN(f) || math.IsInf(f, 0)
+}
+
+// splitKeep 把逗号分隔的列名列表拆成数组，忽略空白片段。
 func splitKeep(s string) []string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -188,15 +375,15 @@ func normHeader(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
-// writeRow 按列索引映射输出一行，索引越界时补空串（防御性，正常不会发生）。
-func writeRow(w *csv.Writer, rec []string, idx []int) error {
-	out := make([]string, len(idx))
-	for j, ci := range idx {
+// mapRow 按列索引映射一行到输出（keep 空间），索引越界时补空串（防御性）。
+func mapRow(rec []string, outIdx []int) []string {
+	out := make([]string, len(outIdx))
+	for j, ci := range outIdx {
 		if ci < len(rec) {
 			out[j] = rec[ci]
 		}
 	}
-	return w.Write(out)
+	return out
 }
 
 // wrapParseError 把 csv 解析错误补上行号信息。
